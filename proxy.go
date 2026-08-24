@@ -742,7 +742,9 @@ func connectDirect2(url *URL, siteInfo *VisitCnt, recursive bool) (net.Conn, err
 	var c net.Conn
 	var err error
 	if siteInfo.AlwaysDirect() {
-		c, err = net.Dial("tcp", url.HostPort)
+		// Bug #2: the AlwaysDirect branch used net.Dial without timeout. Use a
+		// generous upper bound so a hanging direct connection can't block forever.
+		c, err = net.DialTimeout("tcp", url.HostPort, maxTimeout)
 	} else {
 		to := dialTimeout
 		if siteInfo.OnceBlocked() && to >= defaultDialTimeout {
@@ -922,6 +924,11 @@ func (sv *serverConn) releaseBuf() {
 
 func (sv *serverConn) Close() error {
 	sv.releaseBuf()
+	if sv.Conn == nil {
+		// Defensive: a serverConn may be constructed without an underlying
+		// net.Conn (e.g. during pool bookkeeping). Never dereference nil.
+		return nil
+	}
 	if debug {
 		debug.Printf("close connection to %s remains %d concurrent connections\n",
 			sv.hostPort, decSrvConnCnt(sv.hostPort))

@@ -27,7 +27,8 @@ func estimateTimeout(host string, payload []byte) {
 	defer connectBuf.Put(buf)
 	var est time.Duration
 	start := time.Now()
-	c, err := net.Dial("tcp", host+":80")
+	// Bug #1: net.Dial without timeout can block forever on a hanging network.
+	c, err := net.DialTimeout("tcp", host+":80", config.DialTimeout)
 	if err != nil {
 		errl.Printf("estimateTimeout: can't connect to %s: %v, network has problem?\n",
 			host, err)

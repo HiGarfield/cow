@@ -351,7 +351,8 @@ func (hp *httpParent) initAuth(userPasswd string) {
 }
 
 func (hp *httpParent) connect(url *URL) (net.Conn, error) {
-	c, err := net.Dial("tcp", hp.server)
+	// Bug #3: net.Dial without timeout can block forever on a hanging parent.
+	c, err := net.DialTimeout("tcp", hp.server, dialTimeout)
 	if err != nil {
 		errl.Printf("can't connect to http parent %s for %s: %v\n",
 			hp.server, url.HostPort, err)
@@ -458,7 +459,8 @@ func (cp *cowParent) genConfig() string {
 }
 
 func (cp *cowParent) connect(url *URL) (net.Conn, error) {
-	c, err := net.Dial("tcp", cp.server)
+	// Bug #4: net.Dial without timeout can block forever on a hanging parent.
+	c, err := net.DialTimeout("tcp", cp.server, dialTimeout)
 	if err != nil {
 		errl.Printf("can't connect to cow parent %s for %s: %v\n",
 			cp.server, url.HostPort, err)
@@ -519,7 +521,8 @@ func (sp *socksParent) genConfig() string {
 }
 
 func (sp *socksParent) connect(url *URL) (net.Conn, error) {
-	c, err := net.Dial("tcp", sp.server)
+	// Bug #5: net.Dial without timeout can block forever on a hanging parent.
+	c, err := net.DialTimeout("tcp", sp.server, dialTimeout)
 	if err != nil {
 		errl.Printf("can't connect to socks parent %s for %s: %v\n",
 			sp.server, url.HostPort, err)
@@ -535,6 +538,14 @@ func (sp *socksParent) connect(url *URL) (net.Conn, error) {
 	var n int
 	if n, err = c.Write(socksMsgVerMethodSelection); n != 3 || err != nil {
 		errl.Printf("sending ver/method selection msg %v n = %v\n", err, n)
+		hasErr = true
+		return nil, err
+	}
+
+	// Bug #5: the SOCKS handshake reads below have no deadline; set one so a
+	// parent that accepts TCP but never replies can't block this goroutine.
+	if err = c.SetReadDeadline(time.Now().Add(dialTimeout)); err != nil {
+		errl.Printf("set socks read deadline error %v\n", err)
 		hasErr = true
 		return nil, err
 	}

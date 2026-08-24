@@ -654,100 +654,112 @@ func (rp *Response) hasBody(method string) bool {
 }
 
 // Parse response status and headers.
+// parseResponse reads the response status line and headers. If the server
+// sends interim "100 Continue" responses that the client did not ask for, they
+// are skipped and the next response is parsed, up to a bounded number of times
+// (Bug #6: the previous implementation recursed without bound and could
+// overflow the stack).
 func parseResponse(sv *serverConn, r *Request, rp *Response) (err error) {
-	var s []byte
 	reader := sv.bufRd
-	if sv.maybeFake() {
-		sv.setReadTimeout("parseResponse")
-	}
-	if s, err = reader.ReadSlice('\n'); err != nil {
-		// err maybe timeout caused by explicity setting deadline, EOF, or
-		// reset caused by GFW.
-		debug.Printf("read response status line %v %v\n", err, r)
-		// Server connection with error will not be used any more, so no need
-		// to unset timeout.
-		// For read error, return directly in order to identify whether this
-		// is caused by GFW.
-		return err
-	}
-	if sv.maybeFake() {
-		sv.unsetReadTimeout("parseResponse")
-	}
-	// debug.Printf("Response line %s", s)
-
-	// response status line parsing
-	var f [][]byte
-	if f = FieldsN(s, 3); len(f) < 2 { // status line are separated by SP
-		return fmt.Errorf("malformed response status line: %#v %v", string(s), r)
-	}
-	status, err := ParseIntFromBytes(f[1], 10)
-
-	rp.reset()
-	rp.Status = int(status)
-	if err != nil {
-		return fmt.Errorf("response status not valid: %s len=%d %v", f[1], len(f[1]), err)
-	}
-	if len(f) == 3 {
-		rp.Reason = f[2]
-	}
-
-	proto := f[0]
-	if !bytes.Equal(proto[0:7], []byte("HTTP/1.")) {
-		return fmt.Errorf("invalid response status line: %s request %v", string(f[0]), r)
-	}
-	if proto[7] == '1' {
-		rp.raw.Write(s)
-	} else if proto[7] == '0' {
-		// Should return HTTP version as 1.1 to client since closed connection
-		// will be converted to chunked encoding
-		rp.genStatusLine()
-	} else {
-		return fmt.Errorf("response protocol not supported: %s", f[0])
-	}
-
-	if err = rp.parseHeader(reader, rp.raw, r.URL); err != nil {
-		errl.Printf("parse response header: %v %s\n%s", err, r, rp.Verbose())
-		return err
-	}
-
-	//Check for http error code from config file
-	if config.HttpErrorCode > 0 && rp.Status == config.HttpErrorCode {
-		debug.Println("Requested http code is raised")
-		return CustomHttpErr
-	}
-
-	if rp.Status == statusCodeContinue && !r.ExpectContinue {
-		// not expecting 100-continue, just ignore it and read final response
-		errl.Println("Ignore server 100 response for", r)
-		return parseResponse(sv, r, rp)
-	}
-
-	if rp.Chunking {
-		rp.raw.WriteString(fullHeaderTransferEncoding)
-	} else if rp.ContLen == -1 {
-		// No chunk, no content length, assume close to signal end.
-		rp.ConnectionKeepAlive = false
-		if rp.hasBody(r.Method) {
-			// Connection close, no content length specification.
-			// Use chunked encoding to pass content back to client.
-			debug.Println("add chunked encoding to close connection response", r, rp)
-			rp.raw.WriteString(fullHeaderTransferEncoding)
-		} else {
-			debug.Println("add content-length 0 to close connection response", r, rp)
-			rp.raw.WriteString("Content-Length: 0\r\n")
+	const maxContinue = 16
+	for skipped := 0; ; skipped++ {
+		if skipped > maxContinue {
+			return fmt.Errorf("too many 100-continue responses from server for %v", r)
 		}
-	}
-	// Whether COW should respond with keep-alive depends on client request,
-	// not server response.
-	if r.ConnectionKeepAlive {
-		rp.raw.WriteString(fullHeaderConnectionKeepAlive)
-		rp.raw.WriteString(fullKeepAliveHeader)
-	} else {
-		rp.raw.WriteString(fullHeaderConnectionClose)
-	}
-	rp.raw.WriteString(CRLF)
+		if sv.maybeFake() {
+			sv.setReadTimeout("parseResponse")
+		}
+		s, err := reader.ReadSlice('\n')
+		if err != nil {
+			// err maybe timeout caused by explicity setting deadline, EOF, or
+			// reset caused by GFW.
+			debug.Printf("read response status line %v %v\n", err, r)
+			// Server connection with error will not be used any more, so no need
+			// to unset timeout.
+			// For read error, return directly in order to identify whether this
+			// is caused by GFW.
+			return err
+		}
+		if sv.maybeFake() {
+			sv.unsetReadTimeout("parseResponse")
+		}
+		// debug.Printf("Response line %s", s)
 
-	return nil
+		// response status line parsing
+		var f [][]byte
+		if f = FieldsN(s, 3); len(f) < 2 { // status line are separated by SP
+			return fmt.Errorf("malformed response status line: %#v %v", string(s), r)
+		}
+		status, perr := ParseIntFromBytes(f[1], 10)
+
+		rp.reset()
+		rp.Status = int(status)
+		if perr != nil {
+			return fmt.Errorf("response status not valid: %s len=%d %v", f[1], len(f[1]), perr)
+		}
+		if len(f) == 3 {
+			rp.Reason = f[2]
+		}
+
+		proto := f[0]
+		// Bug #7: a status line shorter than "HTTP/1.x" would panic on slicing.
+		if len(proto) < 8 || !bytes.Equal(proto[0:7], []byte("HTTP/1.")) {
+			return fmt.Errorf("invalid response status line: %s request %v", string(f[0]), r)
+		}
+		if proto[7] == '1' {
+			rp.raw.Write(s)
+		} else if proto[7] == '0' {
+			// Should return HTTP version as 1.1 to client since closed connection
+			// will be converted to chunked encoding
+			rp.genStatusLine()
+		} else {
+			return fmt.Errorf("response protocol not supported: %s", f[0])
+		}
+
+		if err = rp.parseHeader(reader, rp.raw, r.URL); err != nil {
+			errl.Printf("parse response header: %v %s\n%s", err, r, rp.Verbose())
+			return err
+		}
+
+		//Check for http error code from config file
+		if config.HttpErrorCode > 0 && rp.Status == config.HttpErrorCode {
+			debug.Println("Requested http code is raised")
+			return CustomHttpErr
+		}
+
+		if rp.Status == statusCodeContinue && !r.ExpectContinue {
+			// not expecting 100-continue, just ignore it and read final response
+			errl.Println("Ignore server 100 response for", r)
+			continue
+		}
+
+		if rp.Chunking {
+			rp.raw.WriteString(fullHeaderTransferEncoding)
+		} else if rp.ContLen == -1 {
+			// No chunk, no content length, assume close to signal end.
+			rp.ConnectionKeepAlive = false
+			if rp.hasBody(r.Method) {
+				// Connection close, no content length specification.
+				// Use chunked encoding to pass content back to client.
+				debug.Println("add chunked encoding to close connection response", r, rp)
+				rp.raw.WriteString(fullHeaderTransferEncoding)
+			} else {
+				debug.Println("add content-length 0 to close connection response", r, rp)
+				rp.raw.WriteString("Content-Length: 0\r\n")
+			}
+		}
+		// Whether COW should respond with keep-alive depends on client request,
+		// not server response.
+		if r.ConnectionKeepAlive {
+			rp.raw.WriteString(fullHeaderConnectionKeepAlive)
+			rp.raw.WriteString(fullKeepAliveHeader)
+		} else {
+			rp.raw.WriteString(fullHeaderConnectionClose)
+		}
+		rp.raw.WriteString(CRLF)
+
+		return nil
+	}
 }
 
 func unquote(s string) string {
